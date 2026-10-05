@@ -9,7 +9,7 @@ import (
 	"ninja-tui/internal/webhook"
 )
 
-// detailContent renders the full email context for the right-hand viewport in
+// detailContent renders the full email context for the right pane in
 // the mandated order: complete headers, every decoded body in order, URLs,
 // attachments, images/OCR, auth results, then the verdict block.
 func (m *Model) detailContent(e store.Entry) string {

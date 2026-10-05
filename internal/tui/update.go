@@ -63,11 +63,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// sync rebuilds every derived list and the right pane after data changes.
+// sync rebuilds the left list and the right tree after data changes. Expansion
+// maps are never touched here, so nodes stay open across updates.
 func (m *Model) sync() {
 	m.rebuildRows()
-	m.rebuildSubjects()
-	m.updateDetail()
+	m.rebuildTree()
 }
 
 func (m *Model) handleScan(msg scanDoneMsg) (tea.Model, tea.Cmd) {
@@ -80,14 +80,13 @@ func (m *Model) handleScan(msg scanDoneMsg) (tea.Model, tea.Cmd) {
 	m.scanErr = ""
 	m.importHint = ""
 	m.cfg.Dir = msg.Dir
-	m.nav = navList
+	m.focus = focusLeft
 	importSelected := m.cursorOnImport()
 	m.st.Replace(msg.Files)
 	m.sync()
 	if importSelected && m.st.Len() > 0 {
 		entries := m.st.Entries()
 		m.selectKey("file:" + entries[0].TUIID)
-		m.sync()
 	}
 
 	// Auto-send: a completed scan starts the run immediately. Pressing s
@@ -221,8 +220,21 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.notice = ""
 		return m, m.scanCmd(m.cfg.Dir)
 
+	case key.Matches(msg, m.keys.Focus):
+		if m.focus == focusLeft {
+			m.focus = focusTree
+		} else {
+			m.focus = focusLeft
+		}
+		return m, nil
+
+	case key.Matches(msg, m.keys.CollapseAll):
+		m.collapseAll()
+		return m, nil
+
 	case key.Matches(msg, m.keys.Back):
-		return m.goBack()
+		m.collapseCurrent()
+		return m, nil
 
 	case key.Matches(msg, m.keys.Resume):
 		if m.paused {
@@ -238,16 +250,16 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.activateCurrent()
 
 	case msg.String() == "up", msg.String() == "k":
-		return m.moveFocus(-1, msg)
+		return m.moveFocus(-1)
 
 	case msg.String() == "down", msg.String() == "j":
-		return m.moveFocus(1, msg)
+		return m.moveFocus(1)
 
 	case msg.String() == "pgup", msg.String() == "b":
-		return m.pageFocus(-1, msg)
+		return m.pageFocus(-1)
 
 	case msg.String() == "pgdown", msg.String() == "f", msg.String() == " ":
-		return m.pageFocus(1, msg)
+		return m.pageFocus(1)
 	}
 	return m, nil
 }
@@ -259,75 +271,39 @@ func (m *Model) beginPathEdit() tea.Cmd {
 	return m.pathBox.Focus()
 }
 
-// moveFocus moves within whichever pane has focus: left list, subject list,
-// or the full-email viewport.
-func (m *Model) moveFocus(delta int, msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	switch m.nav {
-	case navList:
+// moveFocus moves the selection within whichever pane has focus.
+func (m *Model) moveFocus(delta int) (tea.Model, tea.Cmd) {
+	if m.focus == focusLeft {
 		m.moveLeft(delta)
 		return m, nil
-	case navSubjects:
-		m.moveSubject(delta)
-		return m, nil
-	default:
-		var cmd tea.Cmd
-		m.detail, cmd = m.detail.Update(msg)
-		return m, cmd
 	}
-}
-
-func (m *Model) pageFocus(delta int, msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	switch m.nav {
-	case navList:
-		m.moveLeft(delta * maxInt(1, m.bodyHeight-1))
-		return m, nil
-	case navSubjects:
-		m.moveSubject(delta * m.subjectHeight())
-		return m, nil
-	default:
-		var cmd tea.Cmd
-		m.detail, cmd = m.detail.Update(msg)
-		return m, cmd
-	}
-}
-
-// goBack walks the drill-down the other way: full email -> subjects ->
-// files/scores.
-func (m *Model) goBack() (tea.Model, tea.Cmd) {
-	switch m.nav {
-	case navDetail:
-		if m.detailFrom == navSubjects {
-			m.nav = navSubjects
-		} else {
-			m.nav = navList
-		}
-	case navSubjects:
-		m.nav = navList
-	default:
-		if m.mode == ModeResults || m.mode == ModeSending {
-			m.mode = ModeQueue
-		}
-	}
-	m.sync()
+	m.moveTree(delta)
 	return m, nil
 }
 
-// activateCurrent is enter: it activates the selected left row or opens the
-// selected subject.
+// pageFocus pages through the focused pane: the left list moves the cursor, the
+// tree scrolls the view so long full emails can be read with the keyboard.
+func (m *Model) pageFocus(delta int) (tea.Model, tea.Cmd) {
+	page := maxInt(1, m.bodyHeight-1)
+	if m.focus == focusLeft {
+		m.moveLeft(delta * page)
+		return m, nil
+	}
+	m.scrollTree(delta * page)
+	return m, nil
+}
+
+// activateCurrent is enter: it activates the selected left row or toggles the
+// selected tree node.
 func (m *Model) activateCurrent() (tea.Model, tea.Cmd) {
-	switch m.nav {
-	case navList:
+	if m.focus == focusLeft {
 		r, ok := m.rowAt(m.cursor)
 		if !ok {
 			return m, nil
 		}
 		return m.activateRow(r)
-	case navSubjects:
-		if m.subjCursor >= 0 && m.subjCursor < len(m.subjIdx) {
-			m.openDetail(m.subjIdx[m.subjCursor], navSubjects)
-		}
-		return m, nil
 	}
+	m.toggleCurrent()
 	return m, nil
 }
 
@@ -341,64 +317,53 @@ func (m *Model) activateRow(r listRow) (tea.Model, tea.Cmd) {
 		m.notice = ""
 		return m, m.importCmd()
 	case rowFile:
-		m.openDetail(r.file, navList)
-	case rowGroup:
-		m.nav = navSubjects
-		m.subjGroup = r.group
-		m.subjCursor, m.subjOffset = 0, 0
-		m.sync()
+		if e, ok := m.st.Entry(r.file); ok {
+			m.revealEntry(e)
+		}
 	}
 	return m, nil
 }
 
-func (m *Model) openDetail(storeIdx int, from navLevel) {
-	if _, ok := m.st.Entry(storeIdx); !ok {
-		return
-	}
-	m.nav = navDetail
-	m.detailFrom = from
-	m.detailIdx = storeIdx
-	m.sync()
-	m.detail.GotoTop()
-}
-
-// handleMouse maps a left click to a row: left-pane rows (Import button, file
-// rows, group headers) and right-pane subject rows.
+// handleMouse maps a left click to a pane: left rows select/highlight (the
+// Import button still opens the dialog), tree rows toggle expand/collapse.
 func (m *Model) handleMouse(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
-	if msg.Button != tea.MouseLeft || m.editingPath {
+	if msg.Button != tea.MouseLeft || m.editingPath || m.width <= 0 {
 		return m, nil
 	}
-	lw := m.leftPane
-	if lw <= 0 {
-		lw = m.leftWidth(m.width)
-	}
+	const bodyTop = 1 // one header line
+	lw, _ := m.split(m.width)
 	if msg.X < lw {
-		const bodyTop = 1 // one header line
 		y := msg.Y - bodyTop
 		if y < 0 {
 			return m, nil
 		}
 		r, ok := m.rowAt(m.leftOffset + y)
-		if !ok || r.kind == rowSection {
+		if !ok || !selectable(r) {
 			return m, nil
 		}
+		m.focus = focusLeft
 		m.cursor = m.leftOffset + y
 		m.ensureLeftVisible()
-		return m.activateRow(r)
+		if r.kind == rowImport {
+			return m.activateRow(r)
+		}
+		return m, nil
 	}
 
-	if m.subjectsShown() {
-		const bodyTop, titleLines = 1, 1
-		y := msg.Y - bodyTop - titleLines
-		if y < 0 {
-			return m, nil
-		}
-		idx := m.subjOffset + y
-		if idx >= 0 && idx < len(m.subjIdx) {
-			m.nav = navSubjects
-			m.subjCursor = idx
-			m.openDetail(m.subjIdx[idx], navSubjects)
-		}
+	m.focus = focusTree
+	y := msg.Y - bodyTop
+	if y < 0 {
+		return m, nil
+	}
+	line := m.treeOffset + y
+	idx, ok := m.treeNodeIndexAtLine(line)
+	if !ok {
+		return m, nil
+	}
+	n := m.treeNodes[idx]
+	m.setTreeCursor(idx)
+	if n.line == line {
+		m.toggleCurrent()
 	}
 	return m, nil
 }
@@ -408,41 +373,13 @@ func (m *Model) handleWheel(msg tea.MouseWheelMsg) (tea.Model, tea.Cmd) {
 	if msg.Button == tea.MouseWheelUp {
 		delta = -1
 	}
-	switch {
-	case m.nav == navDetail:
-		var cmd tea.Cmd
-		m.detail, cmd = m.detail.Update(msg)
-		return m, cmd
-	case m.subjectsShown():
-		m.moveSubject(delta)
-	default:
-		m.moveLeft(delta)
+	lw, _ := m.split(m.width)
+	if msg.X >= lw {
+		m.scrollTree(delta * 3)
+		return m, nil
 	}
+	m.moveLeft(delta)
 	return m, nil
-}
-
-// updateDetail refreshes the full-email viewport from the current selection.
-func (m *Model) updateDetail() {
-	var e store.Entry
-	var ok bool
-	switch {
-	case m.nav == navDetail:
-		e, ok = m.st.Entry(m.detailIdx)
-	case m.nav == navList:
-		if r, rok := m.rowAt(m.cursor); rok && r.kind == rowFile {
-			e, ok = m.st.Entry(r.file)
-		}
-	}
-	if !ok {
-		m.detail.SetContent("")
-		m.detailKey = ""
-		return
-	}
-	m.detail.SetContent(m.detailContent(e))
-	if e.TUIID != m.detailKey {
-		m.detail.GotoTop()
-	}
-	m.detailKey = e.TUIID
 }
 
 // beginSend starts a run for every queued or previously failed file.

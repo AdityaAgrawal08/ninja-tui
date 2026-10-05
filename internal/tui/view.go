@@ -4,15 +4,14 @@ import (
 	"fmt"
 	"strings"
 
-	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 )
 
 // View implements tea.Model. Layout: one header line, a split body
-// (left list | separator | right pane), and a two-line footer
-// (status + key hints). Mouse clicks/releases/wheel are enabled here.
+// (left Files list | separator | right classification tree), and a two-line
+// footer (status + key hints). Mouse clicks/wheel are enabled here.
 func (m *Model) View() tea.View {
 	if !m.ready {
 		v := tea.NewView("starting ninja-tui…")
@@ -32,16 +31,11 @@ func (m *Model) View() tea.View {
 	}
 	m.bodyHeight = bodyH
 
-	lw := m.leftWidth(w)
-	rw := w - lw - 1
-	if rw < 12 {
-		rw = 12
-		lw = maxInt(10, w-rw-1)
-	}
+	lw, rw := m.split(w)
 	m.leftPane = lw
 
 	left := fitBlock(m.renderLeft(lw, bodyH), lw, bodyH)
-	right := fitBlock(m.renderRight(rw, bodyH), rw, bodyH)
+	right := fitBlock(m.renderTreePane(rw, bodyH), rw, bodyH)
 	sep := styleDim.Render(strings.Repeat("│\n", bodyH-1) + "│")
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, left, sep, right)
@@ -77,162 +71,6 @@ func (m *Model) renderHeader() string {
 	return styleTitle.Render("ninja-tui") +
 		"  " + styleDim.Render("["+m.mode.String()+"]") +
 		"  " + styleDim.Render("dir ") + styleText.Render(m.cfg.Dir)
-}
-
-// renderRight picks the right-pane content: the subject list of the selected
-// group, the full email context, or the setup/pairing text.
-func (m *Model) renderRight(rw, bodyH int) string {
-	switch {
-	case m.subjectsShown():
-		return m.renderSubjects(rw, bodyH)
-	case m.nav == navDetail || m.cursorOnFile():
-		return m.renderDetail(rw, bodyH)
-	default:
-		return m.renderSetupPane(rw, bodyH)
-	}
-}
-
-// renderDetail renders the full email context in a scrollable viewport,
-// with the send progress above it while a run is in flight.
-func (m *Model) renderDetail(rw, bodyH int) string {
-	prefix := m.progressBlock(rw)
-	if m.nav == navDetail {
-		hint := styleDim.Render("full email — ↑/↓ scroll · esc back")
-		if prefix == "" {
-			prefix = fitBlock(hint, rw, 1)
-		} else {
-			prefix += "\n" + hint
-		}
-	}
-	prefixH := 0
-	if prefix != "" {
-		prefixH = lipgloss.Height(prefix)
-		if prefixH >= bodyH {
-			return fitBlock(prefix, rw, bodyH)
-		}
-	}
-	m.detail.SetWidth(rw)
-	m.detail.SetHeight(bodyH - prefixH)
-	return prefix + m.detail.View()
-}
-
-func (m *Model) progressBlock(rw int) string {
-	counts := m.st.Counts()
-	var lines []string
-	if m.send.Running() {
-		done := counts.Sent + counts.Failed
-		pct := 0.0
-		if m.runTotal > 0 {
-			pct = float64(done) / float64(m.runTotal)
-		}
-		lines = append(lines,
-			m.spin.View()+" "+styleText.Render(fmt.Sprintf("sending %d/%d  results %d", done, m.runTotal, counts.Results)),
-			m.prog.ViewAs(pct),
-		)
-		if m.paused {
-			lines = append(lines, styleBad.Render(m.pauseMsg))
-		}
-	} else if m.notice != "" {
-		lines = append(lines, styleNotice.Render(m.notice))
-	}
-	if len(lines) == 0 {
-		return ""
-	}
-	return fitBlock(joinLines(lines), rw, len(lines))
-}
-
-func (m *Model) renderSetupPane(rw, bodyH int) string {
-	v := viewport.New(viewport.WithWidth(rw), viewport.WithHeight(bodyH))
-	v.SoftWrap = true
-	v.SetContent(m.setupText())
-	return v.View()
-}
-
-// setupText is the first-run and empty-folder screen. It shows the exact
-// ninja-side configuration the user needs, because the TUI never starts ninja.
-func (m *Model) setupText() string {
-	var b strings.Builder
-	hook := webhookURL(m.webhookAddr)
-
-	b.WriteString(styleTitle.Render("Import .eml files"))
-	b.WriteString("\n\n")
-	b.WriteString(styleText.Render("Press enter on [ Import ] to pick the folder with the system dialog."))
-	b.WriteString("\n")
-	b.WriteString(styleDim.Render("zenity missing? install it: sudo pacman -S zenity — or press / and type a path."))
-	b.WriteString("\n\n")
-
-	switch {
-	case m.scanErr != "":
-		b.WriteString(styleBad.Render("Could not scan folder:"))
-		b.WriteString("\n")
-		b.WriteString(styleText.Render(m.cfg.Dir))
-		b.WriteString("\n")
-		b.WriteString(styleDim.Render(m.scanErr))
-		b.WriteString("\n\n")
-	case m.st.Len() == 0:
-		b.WriteString(styleText.Render("No .eml files in this folder yet."))
-		b.WriteString("\n")
-		b.WriteString(styleDim.Render("Put exported mail there, press / to type another folder, or r to rescan."))
-		b.WriteString("\n\n")
-	}
-
-	b.WriteString(styleText.Render("This TUI talks to a ninja SMTP server that you run yourself."))
-	b.WriteString("\n")
-	b.WriteString(styleText.Render("It never starts or manages ninja."))
-	b.WriteString("\n\n")
-
-	b.WriteString(styleSection.Render("PAIRING WITH NINJA"))
-	b.WriteString("\n")
-	b.WriteString(styleText.Render("Point ninja's SMTP webhook at this TUI:"))
-	b.WriteString("\n\n")
-	b.WriteString(styleText.Render("  smtp:"))
-	b.WriteString("\n")
-	b.WriteString(styleWarn.Render("    webhook_url: " + hook))
-	b.WriteString("\n\n")
-	b.WriteString(styleDim.Render("  # equivalent environment variable:"))
-	b.WriteString("\n")
-	b.WriteString(styleDim.Render("  NINJA_SMTP_WEBHOOK_URL=" + hook))
-	b.WriteString("\n\n")
-	b.WriteString(styleText.Render("Run it yourself, then leave it running:"))
-	b.WriteString("\n\n")
-	b.WriteString(styleWarn.Render("  ninja smtp --config <file>"))
-	b.WriteString("\n\n")
-
-	b.WriteString(styleSection.Render("STATUS"))
-	b.WriteString("\n")
-	fmt.Fprintf(&b, "%s %s %s\n",
-		styleDim.Render("smtp   "),
-		styleText.Render(m.cfg.SMTPAddr),
-		m.smtpLabel())
-	if m.webhookErr != "" {
-		fmt.Fprintf(&b, "%s %s\n",
-			styleDim.Render("hook   "),
-			styleBad.Render("not listening: "+m.webhookErr))
-	} else {
-		fmt.Fprintf(&b, "%s %s\n",
-			styleDim.Render("hook   "),
-			styleGood.Render(hook))
-	}
-	fmt.Fprintf(&b, "%s %s\n",
-		styleDim.Render("folder "),
-		styleText.Render(m.cfg.Dir))
-
-	b.WriteString("\n")
-	b.WriteString(styleDim.Render("After import, files are sent to ninja automatically."))
-	b.WriteString("\n")
-	b.WriteString(styleDim.Render("Results group into By score; enter drills into subjects and full emails."))
-	return b.String()
-}
-
-func (m *Model) smtpLabel() string {
-	switch {
-	case !m.smtpChecked:
-		return styleWarn.Render("checking…")
-	case m.smtpErr != "":
-		return styleBad.Render("unreachable (" + m.smtpErr + ")")
-	default:
-		return styleGood.Render("reachable")
-	}
 }
 
 // renderFooter is the two-line status bar: dir | SMTP | sent n/N | results n |
@@ -278,7 +116,7 @@ func (m *Model) renderFooter(w int) string {
 	}, sep)
 
 	line2 := styleDim.Render(keyHints())
-	if m.st.Len() == 0 && !m.editingPath {
+	if m.st.Len() == 0 {
 		// Keep both the key hints and the pairing hint visible while the
 		// folder is still empty.
 		line2 = styleDim.Render("pair ninja: webhook_url "+webhookURL(m.webhookAddr)) +
@@ -287,7 +125,10 @@ func (m *Model) renderFooter(w int) string {
 	if m.paused {
 		line2 = styleBad.Render("PAUSED — press s to resume") + styleDim.Render("  ·  ") + line2
 	} else if m.send.Running() {
-		line2 = styleWarn.Render("sending…") + styleDim.Render("  ·  ") + line2
+		line2 = styleWarn.Render(m.spin.View()+" sending…") + styleDim.Render("  ·  ") + line2
+	}
+	if m.notice != "" {
+		line2 = styleNotice.Render(m.notice) + styleDim.Render("  ·  ") + line2
 	}
 	if m.importHint != "" {
 		line2 = styleWarn.Render(m.importHint) + styleDim.Render("  ·  ") + line2

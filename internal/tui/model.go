@@ -7,10 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"charm.land/bubbles/v2/progress"
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textinput"
-	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 
 	"ninja-tui/internal/eml"
@@ -32,15 +30,31 @@ type Config struct {
 	Store *store.Store
 }
 
-// navLevel is where keyboard focus and the right pane are: the left list, the
-// subject list of one score group, or one full email context.
-type navLevel int
+// focusPane is which pane receives up/down, enter, and esc: the left file list
+// or the right classification tree.
+type focusPane int
 
 const (
-	navList navLevel = iota
-	navSubjects
-	navDetail
+	focusLeft focusPane = iota
+	focusTree
 )
+
+// treeNodeKind is the kind of one selectable row in the right tree.
+type treeNodeKind int
+
+const (
+	nodeGroup treeNodeKind = iota
+	nodeSubject
+)
+
+// treeNode is one selectable row of the flattened classification tree. line is
+// the index of its first rendered line in Model.treeLines.
+type treeNode struct {
+	kind  treeNodeKind
+	group string // group key, for nodeGroup
+	tuiID string // message tui-id, for nodeSubject
+	line  int
+}
 
 // Model is the single Bubble Tea model for ninja-tui.
 type Model struct {
@@ -53,32 +67,32 @@ type Model struct {
 	width, height int
 	ready         bool
 
-	detail  viewport.Model
 	spin    spinner.Model
-	prog    progress.Model
 	pathBox textinput.Model
 
 	editingPath bool
 	importHint  string
 
-	// Navigation: left list -> subject list -> full email.
-	nav        navLevel
-	detailFrom navLevel
-	detailIdx  int
-	detailKey  string
+	// focus is the pane that up/down/enter/esc act on.
+	focus focusPane
 
-	// Left pane rows (Import button, Files, By score).
+	// Left pane rows: Import button, Files section, one row per imported file.
 	rows       []listRow
 	cursor     int
 	leftOffset int
 	leftPane   int
 	bodyHeight int
 
-	// Subject list of the group currently shown in the right pane.
-	subjGroup  string
-	subjIdx    []int
-	subjCursor int
-	subjOffset int
+	// Right pane: the classification tree. Expansion is tracked by stable ids
+	// (group key and message tui-id) so webhook arrivals and progress updates
+	// never collapse a node.
+	expandedGroups map[string]bool
+	expandedMsgs   map[string]bool
+	treeNodes      []treeNode
+	treeLines      []string
+	treeCursor     int
+	treeOffset     int
+	treeSel        string
 
 	scanErr string
 	notice  string
@@ -108,30 +122,27 @@ func New(cfg Config) *Model {
 		cfg.Dir = "."
 	}
 
-	v := viewport.New(viewport.WithWidth(60), viewport.WithHeight(12))
-	v.SoftWrap = true
 	sp := spinner.New(spinner.WithSpinner(spinner.Dot))
-	pr := progress.New(progress.WithWidth(40), progress.WithoutPercentage())
 	ti := textinput.New()
 	ti.Prompt = "path> "
 	ti.Placeholder = "folder with .eml files"
 	ti.CharLimit = 1024
 
 	m := &Model{
-		cfg:        cfg,
-		st:         cfg.Store,
-		send:       sender.New(sender.Config{Addr: cfg.SMTPAddr, From: cfg.From, To: cfg.To}),
-		keys:       DefaultKeyMap(),
-		mode:       ModeSetup,
-		detail:     v,
-		spin:       sp,
-		prog:       pr,
-		pathBox:    ti,
-		detailIdx:  -1,
-		bodyHeight: 12,
-		autoSend:   true,
+		cfg:            cfg,
+		st:             cfg.Store,
+		send:           sender.New(sender.Config{Addr: cfg.SMTPAddr, From: cfg.From, To: cfg.To}),
+		keys:           DefaultKeyMap(),
+		mode:           ModeSetup,
+		spin:           sp,
+		pathBox:        ti,
+		bodyHeight:     12,
+		autoSend:       true,
+		expandedGroups: make(map[string]bool),
+		expandedMsgs:   make(map[string]bool),
 	}
 	m.rebuildRows()
+	m.rebuildTree()
 	return m
 }
 
@@ -191,29 +202,57 @@ func (m *Model) waitEventCmd() tea.Cmd {
 	}
 }
 
+// split divides the terminal width into the left pane, the separator column,
+// and the right pane. View, layout, and mouse hit-testing all use it so they
+// always agree on the boundary.
+func (m *Model) split(total int) (left, right int) {
+	if total < 4 {
+		total = 4
+	}
+	lw := m.leftWidth(total)
+	rw := total - lw - 1
+	if rw < 12 {
+		rw = 12
+		lw = total - rw - 1
+		if lw < 10 {
+			lw = 10
+		}
+	}
+	if lw+rw+1 > total {
+		rw = total - lw - 1
+		if rw < 1 {
+			rw = 1
+			lw = maxInt(1, total-2)
+		}
+	}
+	return lw, rw
+}
+
+// rightWidth is the usable width of the right pane.
+func (m *Model) rightWidth() int {
+	if m.width <= 0 {
+		return 12
+	}
+	_, rw := m.split(m.width)
+	return rw
+}
+
 // layout recomputes pane sizes after a resize.
 func (m *Model) layout() {
-	w, h := m.width, m.height
-	if w <= 0 || h <= 0 {
+	if m.width <= 0 || m.height <= 0 {
 		return
 	}
-	bodyH := h - 3 // one header line, two footer lines
+	bodyH := m.height - 3 // one header line, two footer lines
 	if bodyH < 3 {
 		bodyH = 3
 	}
 	m.bodyHeight = bodyH
-	lw := m.leftWidth(w)
-	rw := w - lw - 1
-	if rw < 12 {
-		rw = 12
-		lw = maxInt(10, w-rw-1)
-	}
+	lw, _ := m.split(m.width)
 	m.leftPane = lw
-	m.detail.SetWidth(rw)
-	m.detail.SetHeight(bodyH)
-	m.prog.SetWidth(maxInt(10, rw-2))
+	m.rebuildRows()
+	m.rebuildTree()
 	m.ensureLeftVisible()
-	m.ensureSubjectVisible()
+	m.ensureTreeVisible()
 }
 
 // humanSize formats byte counts for the detail pane.
@@ -248,9 +287,12 @@ func webhookURL(addr string) string {
 // keyHints is the always-visible key legend in the footer.
 func keyHints() string {
 	return strings.Join([]string{
-		"enter select/open",
+		"↑/↓ move",
+		"enter expand/collapse",
+		"esc collapse",
+		"c collapse all",
+		"tab pane",
 		"s send/resume",
-		"esc back",
 		"/ path",
 		"r rescan",
 		"q quit",
